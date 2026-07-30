@@ -26,7 +26,7 @@ data:
   AQUA_KB_IMAGE_NAME: "{{ .Values.kubebenchImage.repository }}:{{ .Values.kubebenchImage.tag }}"
   AQUA_ME_IMAGE_NAME: "{{ .Values.global.imageCredentials.repositoryUriPrefix }}/{{ .Values.microEnforcerImage.repository }}:{{ .Values.microEnforcerImage.tag }}"
   AQUA_KB_ME_REGISTRY_NAME: "{{ template "registrySecret" .  }}"
-  AQUA_HEALTH_MONITOR_PORT: "{{ .Values.readinessProbe.httpGet.port }}"
+  AQUA_HEALTH_MONITOR_PORT: {{ include "kube-enforcer.healthMonitorPort" . | quote }}
   {{- end }}
   {{- if .Values.global.enforcer.enabled }}
   AQUA_ENFORCER_DS_NAME: {{ .Release.Name }}-ds
@@ -49,7 +49,8 @@ data:
   AQUA_ROOT_CA: "/opt/aquasec/ssl/ca.pem"
 {{- end }}
 {{- end }}
-  AQUA_GATEWAY_SECURE_ADDRESS: {{ .Values.global.gateway.address | default "aqua-gateway-svc" }}:{{ .Values.global.gateway.port | default "8443" }}
+{{- $gateway := .Values.global.gateway | default (dict) }}
+  AQUA_GATEWAY_SECURE_ADDRESS: {{ $gateway.address | default "aqua-gateway-svc" }}:{{ $gateway.port | default "8443" }}
   AQUA_KAP_ADD_ALL_CONTROL: "true"
   AQUA_WATCH_CONFIG_AUDIT_REPORT: "true"
 {{- if .Values.kubeEnforcerAdvance.enable }}

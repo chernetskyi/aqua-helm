@@ -109,6 +109,165 @@ Create chart name and version as used by the chart label.
 {{- end }}
 {{- end }}
 
+{{- define "networkPolicy.dnsNamespace" -}}
+{{- if .Values.networkPolicy.dnsNamespace -}}
+{{- .Values.networkPolicy.dnsNamespace -}}
+{{- else if or (eq .Values.global.platform "openshift") (.Capabilities.APIVersions.Has "route.openshift.io/v1") -}}
+openshift-dns
+{{- else -}}
+kube-system
+{{- end -}}
+{{- end -}}
+
+{{- define "networkPolicy.ingressSystemNamespace" -}}
+{{- if .Values.networkPolicy.ingressSystemNamespace -}}
+{{- .Values.networkPolicy.ingressSystemNamespace -}}
+{{- else -}}
+kube-system
+{{- end -}}
+{{- end -}}
+
+{{- define "networkPolicy.ipBlock" -}}
+{{- if not (or .cidr .cidrV6) }}
+{{- fail "networkPolicy ipBlock requires cidr or cidrV6" }}
+{{- end }}
+{{- if .cidr }}
+- ipBlock:
+    cidr: {{ .cidr | quote }}
+{{- end }}
+{{- if .cidrV6 }}
+- ipBlock:
+    cidr: {{ .cidrV6 | quote }}
+{{- end }}
+{{- end -}}
+
+{{/*
+Fails with a clear message if the given port value isn't a plain non-negative integer,
+instead of letting sprig's `int` filter silently coerce a bad value (e.g. a named port,
+which NetworkPolicyPort doesn't support here) into 0. Returns the value unchanged so callers
+pipe the result into `| int`.
+*/}}
+{{- define "networkPolicy.validatedPort" -}}
+{{- if not (regexMatch "^[0-9]+$" (.value | toString)) }}
+{{- fail (printf "%s must be a numeric port (got %v); named ports are not supported" .label .value) }}
+{{- end }}
+{{- .value -}}
+{{- end -}}
+
+{{/*
+An egress "to" peer targeting a namespace by name, with an optional pod-label selector to
+narrow it, on a single TCP port. Renders nothing if .namespace is unset. Shared by the
+gateway/proxy/vault in-cluster egress rules, which are otherwise identical apart from field
+names.
+*/}}
+{{- define "networkPolicy.namespaceEgress" -}}
+{{- if .namespace }}
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .namespace | quote }}
+          {{- if .podLabels }}
+          {{- if not (kindIs "map" .podLabels) }}
+          {{- fail (printf "%s must be a map of pod labels" .podLabelsField) }}
+          {{- end }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .podLabels | nindent 14 }}
+          {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .port }}
+    {{- end }}
+{{- end -}}
+
+{{/*
+Egress "to" a list of CIDRs on a single TCP port. Renders nothing if .cidrs is empty. Shared
+by the gateway/proxy/vault external-egress rules.
+*/}}
+{{- define "networkPolicy.cidrListEgress" -}}
+{{- if .cidrs }}
+    - to:
+        {{- range .cidrs }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .port }}
+    {{- end }}
+{{- end -}}
+
+{{/*
+Extracts a single probe's configured port from httpGet/tcpSocket/grpc (whichever is set),
+as a string, or "" if the probe is nil, has no network port (e.g. an exec probe), or is
+pinned to the sentinel "0", which is never a valid NetworkPolicyPort.
+*/}}
+{{- define "networkPolicy.probePort" -}}
+{{- $port := "" -}}
+{{- with . }}
+{{- with .httpGet }}{{- if .port }}{{- $port = (.port | toString) -}}{{- end -}}{{- end -}}
+{{- with .tcpSocket }}{{- if .port }}{{- $port = (.port | toString) -}}{{- end -}}{{- end -}}
+{{- with .grpc }}{{- if .port }}{{- $port = (.port | toString) -}}{{- end -}}{{- end -}}
+{{- end -}}
+{{- if and $port (not (regexMatch "^[0-9]+$" $port)) }}
+{{- fail (printf "probe port %q must be numeric; this chart's container ports aren't named, so a named port here can never match" $port) }}
+{{- end -}}
+{{- if eq $port "0" }}{{- $port = "" -}}{{- end -}}
+{{- $port -}}
+{{- end -}}
+
+{{/*
+The readinessProbe/livenessProbe pair actually driving kube-enforcer's health checks — the
+envoy sidecar's probes in kubeEnforcerAdvance mode, the container's own otherwise. Both
+networkPolicy.probePorts and kube-enforcer.healthMonitorPort call this so they can't drift
+apart on which probe pair they read. `include` only returns rendered text, so the pair is
+passed through as YAML and parsed back into a dict.
+*/}}
+{{- define "networkPolicy.effectiveProbes" -}}
+{{- if .Values.kubeEnforcerAdvance.enable -}}
+{{- dict "readinessProbe" .Values.kubeEnforcerAdvance.envoy.readinessProbe "livenessProbe" .Values.kubeEnforcerAdvance.envoy.livenessProbe | toYaml -}}
+{{- else -}}
+{{- dict "readinessProbe" .Values.readinessProbe "livenessProbe" .Values.livenessProbe | toYaml -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+Kubelet health-probe ports actually configured on the kube-enforcer container (or, in
+kubeEnforcerAdvance mode, on the envoy sidecar), so NetworkPolicy ingress tracks
+readinessProbe/livenessProbe instead of assuming 8080. If neither probe exposes a network
+port (e.g. the envoy sidecar's default exec probe, or probes deleted entirely), no ports
+are added — there is nothing to open ingress for.
+*/}}
+{{- define "networkPolicy.probePorts" -}}
+{{- $probes := include "networkPolicy.effectiveProbes" . | fromYaml -}}
+{{- $ports := dict -}}
+{{- range list $probes.readinessProbe $probes.livenessProbe }}
+{{- $port := include "networkPolicy.probePort" . }}
+{{- if $port }}
+{{- $_ := set $ports $port true -}}
+{{- end -}}
+{{- end -}}
+{{- $portList := list -}}
+{{- range $port, $_ := $ports }}{{- $portList = append $portList $port -}}{{- end -}}
+{{- if $portList }}
+{{- range $port := $portList }}
+- protocol: TCP
+  port: {{ $port }}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+The port the kube-enforcer container's health-monitor server binds/reports on. Unlike
+networkPolicy.probePorts, this always reads .Values.readinessProbe directly rather than
+networkPolicy.effectiveProbes — the health-monitor server runs in the kube-enforcer
+container itself even in kubeEnforcerAdvance mode, so it must not switch to the envoy
+sidecar's probe.
+*/}}
+{{- define "kube-enforcer.healthMonitorPort" -}}
+{{- include "networkPolicy.probePort" .Values.readinessProbe | default "8080" -}}
+{{- end -}}
+
 {{/*
 Common labels
 */}}

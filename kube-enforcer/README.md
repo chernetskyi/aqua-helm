@@ -24,6 +24,7 @@ This page provides instructions for using Helm charts to configure and deploy th
     - [Create the certificate key and certificate for kube-enforcer](#create-the-certificate-key-and-certificate-for-kube-enforcer)
     - [Create secrets with generated certs and change `values.yaml` as mentioned below](#create-secrets-with-generated-certs-and-change-valuesyaml-as-mentioned-below)
   - [Configuration for KubeEnforcer Advance deployment](#configuration-for-kubeenforcer-advance-deployment)
+  - [NetworkPolicy (optional)](#networkpolicy-optional)
   - [Configuration for KubeEnforcer with cert-manager](#configuration-for-kubeenforcer-with-cert-manager)
   - [Integrate Kube-Enforcer with Hashicorp Vault to Load Token](#integrate-kube-enforcer-with-hashicorp-vault-to-load-token)
   - [Configurable Variables](#configurable-variables)
@@ -68,6 +69,8 @@ extraEnvironmentVars:
 ```
 As Kube Enforcer need to communicate with the KubeAPI, make sure `no_proxy` is configured to by pass the proxy. Use a comma separated list of IPs, FQDN or FQDN suffixes.
 If you deploy the Aqua Enforcer `enforcer.enabled=true` with this chart, make sure you set the environment variables accordingly in the `enforcer` section. 
+
+**If `networkPolicy.enabled=true`**, egress to the proxy is not covered by `gatewayEgressCidrs` / `gatewayNamespace` (those are pinned to `global.gateway.port`, not the proxy's port) or by the default ports on `additionalEgressCidrs`. Configure `networkPolicy.proxyNamespace` + optional `networkPolicy.proxyPodLabels` for an in-cluster proxy, or `networkPolicy.proxyEgressCidrs` for an external/node-level proxy; both require `networkPolicy.proxyPort` (the proxy's listening port, e.g. `8080` for `http://proxy01.proxy.svc.cluster.local:8080` above). On CNIs such as Calico, reaching an in-cluster proxy via its Service ClusterIP does not work under NetworkPolicy egress (DNAT happens before policy evaluation) — use `proxyNamespace` + `proxyPodLabels`, or the proxy pod/node IP CIDR via `proxyEgressCidrs`, instead. See [NetworkPolicy (optional)](#networkpolicy-optional).
 
 ### Configure TLS authentication between the KubeEnforcer and the API Server
 
@@ -282,6 +285,250 @@ To perform kube-bench scans in the cluster, the KubeEnforcer needs:
 
    3. For more customizations please refer to [***Configurable Variables***](#configurable-variables)
 
+## NetworkPolicy (optional)
+
+Requires a CNI that enforces `networking.k8s.io/v1` NetworkPolicy (e.g. Calico). Each CNI implements NetworkPolicies slightly differently and may require a different set of rules. After deployment, follow [Validating NetworkPolicy and webhook reachability](#validating-networkpolicy-and-webhook-reachability) — pod `Ready` alone is not sufficient.
+
+**Warning — Do not enable `networkPolicy.enabled` without setting cluster CIDR values.** Defaults are empty; `helm template` / `helm install` fail when `networkPolicy.enabled=true` and `nodeCidr` or `podCidr` is unset. `serviceCidr` and `controlPlaneCidr` are optional — omit them on managed clouds and use `additionalEgressCidrs` / `additionalIngressCidrs` instead. Gateway egress (`gatewayEgressCidrs` or `gatewayNamespace`) is also required unless `allowInternetHttps=true` and `global.gateway.port` is 443. Use the example values below — the `10.x` CIDRs are placeholders only and must match your cluster.
+
+**Warning — `hostNetwork: true` disables NetworkPolicy for the pod.** Do not enable `networkPolicy.enabled` when `hostNetwork` is true.
+
+This policy applies to kube-enforcer only. Trivy Operator / Starboard are not covered.
+
+### Scope
+
+**What this policy provides:** egress containment for the kube-enforcer pod (DNS, API server, gateway, optional HTTPS) plus ingress scoping for apiserver webhook callbacks and node/control-plane sources.
+
+**What it does not provide:** pod-to-pod isolation. The `podCidr` ingress rule allows any pod in the cluster to reach kube-enforcer on port 8443 and on the configured kubelet probe port (default 8080; see below). Webhook caller source IPs vary by platform, so this breadth is intentional — but do not treat this policy as a boundary between kube-enforcer and other workloads.
+
+Set `networkPolicy.enabled=true` and replace `nodeCidr` and `podCidr` with your cluster values. On dual-stack clusters, set the optional `*CidrV6` companions (`nodeCidrV6`, `podCidrV6`, etc.) so IPv6 traffic is not denied while namespace selectors still work. Set `serviceCidr` and `controlPlaneCidr` for kubeadm-style clusters; omit them on EKS/GKE/AKS and use `additionalEgressCidrs` / `additionalIngressCidrs` instead.
+
+**Ingress vs egress — two different directions:**
+
+All ingress sources below are combined into a single rule, so each source is allowed on **both** 8443 (webhook) and the kubelet health-probe port — the chart does not scope individual sources to a single port. The probe port is read from `readinessProbe.httpGet.port` / `readinessProbe.tcpSocket.port` / `readinessProbe.grpc.port` and the equivalent `livenessProbe.*` fields (defaulting to 8080 when unset); if you override those probe ports, the NetworkPolicy follows automatically. In `kubeEnforcerAdvance` mode the container uses an exec probe instead, so no probe port is opened. See [Scope](#scope) above.
+
+| Direction | Traffic | Ports | Knob |
+|-----------|---------|-------|------|
+| Ingress | apiserver → KE webhook; kubelet health probes (standard mode) | 8443, probe port(s) (default 8080) | `nodeCidr`, `podCidr`, `controlPlaneCidr`, `additionalIngressCidrs` |
+| Ingress | apiserver proxy pods (e.g. GKE konnectivity) | 8443, probe port(s) (default 8080) | `ingressSystemNamespace` (default `kube-system`; independent of `dnsNamespace`) |
+| Egress | KE → cluster DNS | 53 | `dnsNamespace`, optional `dnsPodLabels` |
+| Egress | KE → apiserver (client) | 443, 6443 | `serviceCidr` (443, kubeadm/kube-proxy), `controlPlaneCidr`, `additionalEgressCidrs` |
+| Egress | KE → gateway | `global.gateway.port` | `gatewayEgressCidrs`, `gatewayNamespace` + `gatewayPodLabels` |
+| Egress | KE → HTTP proxy (`extraEnvironmentVars.http_proxy`/`https_proxy`) | `proxyPort` | `proxyEgressCidrs`, `proxyNamespace` + `proxyPodLabels` |
+| Egress | KE → Vault (vault-agent sidecar) | 8200 / 443 | `vaultNamespace` (in-cluster, `vaultExternal=false`), or `vaultExternal=true` with `vaultEgressCidrs` / `allowInternetHttps` (HCP on 443 only) |
+
+The probe-port ingress rule is only added in standard mode (HTTP/TCP readiness/liveness probes). In `kubeEnforcerAdvance` mode, probes use exec instead, so no probe port is added to the policy.
+
+On kubeadm-style clusters, `controlPlaneCidr` covers apiserver webhook callbacks (ingress on 8443) and direct API access (egress on 6443). `serviceCidr:443` covers in-cluster API access via the `kubernetes` Service. On EKS, GKE, and AKS, traffic to `kubernetes.default` is DNAT'd to the real apiserver endpoint, which is often outside `serviceCidr` and `controlPlaneCidr`. Use `additionalEgressCidrs` for those destination IPs — do **not** put them in `additionalIngressCidrs`.
+
+`additionalIngressCidrs` is for apiserver source IPs calling the KE admission webhook (managed-cloud control planes not covered by `nodeCidr` / `podCidr` / `controlPlaneCidr`).
+
+`additionalIngressCidrs` and `additionalEgressCidrs` are IPv4 CIDR strings only — they do not have `*CidrV6` companions. On dual-stack managed clouds, add IPv6 entries as additional list items if your apiserver or endpoint uses IPv6.
+
+`additionalEgressCidrs` accepts a flat CIDR list (ports 443 and 6443) or objects with `cidr` and optional `ports` (defaults to 443 and 6443 when omitted):
+
+```yaml
+additionalEgressCidrs:
+  - "10.0.2.0/24"               # flat CIDR → ports 443 and 6443
+  - cidr: "10.0.0.5/32"
+    ports: [443]                 # custom port list per entry
+```
+
+**Private vs public endpoints — when to use which CIDR type**
+
+All examples below use private `10.x` placeholders. Substitute values from *your* cluster — never copy CIDRs from documentation.
+
+| Scenario | Use | Knob |
+|----------|-----|------|
+| Private apiserver endpoint (VPC, master CIDR, VNet integration) | Provider-published private CIDR | `additionalEgressCidrs` |
+| Public apiserver endpoint enabled | Endpoint IPs/CIDRs from your `describe-cluster` / cloud console output | `additionalEgressCidrs` |
+| Authorized networks / apiserver source ranges | Ranges configured on the control plane | `additionalIngressCidrs` |
+| In-cluster gateway (pod selector or pod IP CIDR) | `gatewayNamespace` + `gatewayPodLabels`, or gateway pod/node CIDR | `gatewayNamespace` / `gatewayEgressCidrs` |
+| SaaS or external gateway with `allowInternetHttps=false` | Gateway endpoint CIDRs from your onboarding / provider | `gatewayEgressCidrs` |
+| SaaS or external gateway with `allowInternetHttps=true` (default) | Broad HTTPS egress (`0.0.0.0/0:443`) — no per-endpoint CIDRs needed | `allowInternetHttps` |
+
+When a managed cluster uses a **public** API endpoint, `serviceCidr` and `controlPlaneCidr` alone are not enough — add the endpoint destination CIDRs to `additionalEgressCidrs`. Obtain them from your cloud provider (cluster describe output, console, or support docs for your account). Do not guess or use third-party IP ranges.
+
+When `allowInternetHttps=false` and the gateway is outside the cluster, add the gateway's endpoint CIDRs to `gatewayEgressCidrs`. Resolve the hostname in `global.gateway.address` with your own DNS lookup and add the results as `/32` entries — use only addresses returned for *your* deployment.
+
+**Gateway egress** uses `global.gateway.port` (8443 on-prem TLS gateway, 443 for SaaS, 3622 for plain gateway service). Configure one or both:
+
+- `networkPolicy.gatewayNamespace` + `networkPolicy.gatewayPodLabels` — in-cluster gateway pods (recommended for gateways in another namespace). `gatewayPodLabels` must be a non-empty map when `gatewayNamespace` is set (`null` fails at template time; Helm merges chart defaults so `{}` alone does not clear the default `aqua.component: gateway`). On CNIs such as Calico, Service ClusterIP egress does **not** work — traffic is DNAT'd to the pod IP before policy evaluation, so use a namespace/pod selector or the gateway pod IP CIDR instead.
+- `networkPolicy.gatewayEgressCidrs` — external gateway, node, or load-balancer CIDRs (not in-cluster Service ClusterIP). Required when the gateway is outside the cluster or `allowInternetHttps=false`.
+
+**Proxy egress** — see [Connect to Aqua Saas / Gateway via proxy](#conncet-to-aqua-saas--gateway-via-proxy). If `extraEnvironmentVars.http_proxy` / `https_proxy` is set, KE's egress destination becomes the proxy instead of the gateway/apiserver/internet directly, and none of the rules above cover it (they target the gateway/apiserver/internet, not the proxy's address and port). Configure `networkPolicy.proxyNamespace` + optional `networkPolicy.proxyPodLabels` (in-cluster proxy) or `networkPolicy.proxyEgressCidrs` (external/node-level proxy); both require `networkPolicy.proxyPort` set to the proxy's listening port. Same Calico-style Service ClusterIP DNAT caveat as gateway egress applies. Template rendering fails when `extraEnvironmentVars` sets `http_proxy`/`https_proxy` (case-insensitive) but neither `proxyNamespace` nor `proxyEgressCidrs` is set.
+
+**DNS egress** targets the cluster DNS namespace via `networkPolicy.dnsNamespace`. Default is `kube-system` (CoreDNS on most clusters). On OpenShift, DNS runs in `openshift-dns`; set `global.platform=openshift` to auto-select it, or set `networkPolicy.dnsNamespace=openshift-dns` explicitly. This is independent of **ingress** from `kube-system` pods (konnectivity / apiserver proxy on GKE), which uses `networkPolicy.ingressSystemNamespace` (default `kube-system`).
+
+By default, DNS egress is allowed to any pod in `dnsNamespace` on port 53. Set `networkPolicy.dnsPodLabels` (e.g. `k8s-app: kube-dns`) to narrow this to your actual DNS pods — the right labels vary by distribution/CNI, so this is opt-in rather than a chart default.
+
+**Vault egress** — when `vaultSecret.enabled=true`, the injected vault-agent shares the pod network namespace. In-cluster Vault (port 8200) requires `networkPolicy.vaultNamespace` (and optional `vaultPodLabels`) with `vaultExternal=false` (default). External/HCP Vault on 443 requires `networkPolicy.vaultExternal=true` plus `allowInternetHttps=true` (default) or explicit `networkPolicy.vaultEgressCidrs` when `allowInternetHttps=false`. `allowInternetHttps` alone does not cover in-cluster Vault on 8200.
+
+**Internet HTTPS egress** is controlled by `networkPolicy.allowInternetHttps` (default `true`). When `true`, the policy adds `0.0.0.0/0:443` and `::/0:443` egress — a broad catch-all suited to SaaS deployments where the gateway endpoint is outside the cluster. When `false`, that rule is omitted for least-privilege egress; gateway traffic must then be allowed explicitly via `gatewayEgressCidrs` and/or `gatewayNamespace`. This applies to on-prem and SaaS alike:
+
+- **On-prem** — set `allowInternetHttps=false` and use `gatewayNamespace` + `gatewayPodLabels`, or list gateway node/LB CIDRs in `gatewayEgressCidrs` at the correct port (3622, 8443, or 443).
+- **SaaS** — either keep `allowInternetHttps=true` (default), or set `allowInternetHttps=false` and add your gateway endpoint CIDRs (from onboarding or DNS lookup of `global.gateway.address`) to `gatewayEgressCidrs` with `global.gateway.port: 443`.
+
+### Discover cluster network values
+
+```shell
+kubectl get configmap kubeadm-config -n kube-system -o yaml
+kubectl get nodes -l node-role.kubernetes.io/control-plane -o wide
+kubectl get svc kubernetes -n default -o jsonpath='{.spec.clusterIP}{"\n"}'
+```
+
+### Discover managed-cloud apiserver CIDRs
+
+Use these to populate `additionalIngressCidrs` (webhook callers) and `additionalEgressCidrs` (KE client destinations). Use private CIDRs when the control plane has a private endpoint; use endpoint CIDRs from your own cluster output when a public endpoint is enabled.
+
+**EKS**
+
+```shell
+# Check endpoint access mode
+aws eks describe-cluster --name <cluster> \
+  --query 'cluster.resourcesVpcConfig.{endpointPublicAccess:endpointPublicAccess,endpointPrivateAccess:endpointPrivateAccess,vpcId:vpcId}'
+
+# Private endpoint: egress destinations are usually within your VPC CIDR blocks
+aws ec2 describe-vpcs --vpc-ids <vpc-id> --query 'Vpcs[].CidrBlock'
+
+# Public endpoint: use the endpoint hostname from describe-cluster output;
+# resolve it with your own DNS tool and add the results to additionalEgressCidrs
+aws eks describe-cluster --name <cluster> --query 'cluster.endpoint' -o text
+
+# Ingress: apiserver sources are typically within VPC CIDRs or the cluster security group
+aws eks describe-cluster --name <cluster> \
+  --query 'cluster.resourcesVpcConfig.{subnetIds:subnetIds,securityGroupIds:securityGroupIds}'
+```
+
+For private endpoints, add VPC or subnet CIDR blocks to `additionalEgressCidrs`. For public endpoints, add the resolved endpoint addresses from your cluster's describe output.
+
+**GKE**
+
+```shell
+# Private endpoint: master CIDR is the egress destination
+gcloud container clusters describe <cluster> --location <location> \
+  --format='value(privateClusterConfig.masterIpv4CidrBlock)'
+
+# Public endpoint: use the endpoint hostname from describe output;
+# resolve it with your own DNS tool and add the results to additionalEgressCidrs
+gcloud container clusters describe <cluster> --location <location> --format='value(endpoint)'
+
+# Ingress: authorized networks (apiserver source ranges calling webhooks)
+gcloud container clusters describe <cluster> --location <location> \
+  --format='value(masterAuthorizedNetworksConfig.cidrBlocks[].cidrBlock)'
+```
+
+Add `masterIpv4CidrBlock` to `additionalEgressCidrs` for private clusters. For public endpoints, add resolved endpoint addresses from your cluster output.
+
+**AKS**
+
+```shell
+# API server access profile (private endpoint, authorized IP ranges)
+az aks show -g <resource-group> -n <cluster> --query apiServerAccessProfile
+
+# API server VNet integration: subnet CIDR is the egress destination
+az network vnet subnet show -g <resource-group> --vnet-name <vnet> -n <subnet> \
+  --query addressPrefix -o tsv
+```
+
+For AKS with API server VNet integration, add the integrated subnet CIDR to `additionalEgressCidrs`. For authorized IP ranges, add those ranges to `additionalIngressCidrs`. When only a public API server is available, use endpoint CIDRs from your cluster's access profile output.
+
+### Example values (on-prem)
+
+```yaml
+global:
+  gateway:
+    address: aqua-gateway-svc.aqua
+    port: 8443
+
+networkPolicy:
+  enabled: true
+  nodeCidr: "10.0.0.0/16"
+  podCidr: "10.244.0.0/16"
+  serviceCidr: "10.96.0.0/12"
+  controlPlaneCidr: "10.0.0.5/32"
+  additionalIngressCidrs:
+    - "10.0.1.0/24"       # apiserver → KE webhook (example managed-cloud source)
+  additionalEgressCidrs:
+    - "10.0.2.0/24"       # KE → apiserver (example private endpoint range)
+  allowInternetHttps: false
+  gatewayNamespace: aqua
+  gatewayPodLabels:
+    aqua.component: gateway
+  # gatewayEgressCidrs only for external/node/LB endpoints — not Service ClusterIP (use gatewayNamespace above)
+```
+
+### Example values (on-prem, via in-cluster HTTP proxy)
+
+Use when `extraEnvironmentVars.http_proxy` / `https_proxy` points at an in-cluster proxy (see [Connect to Aqua Saas / Gateway via proxy](#conncet-to-aqua-saas--gateway-via-proxy)). `proxyPort` must match the proxy's listening port.
+
+```yaml
+extraEnvironmentVars:
+  http_proxy: http://proxy01.proxy.svc.cluster.local:8080
+  https_proxy: http://proxy01.proxy.svc.cluster.local:8080
+  no_proxy: .svc.cluster.local
+
+networkPolicy:
+  enabled: true
+  nodeCidr: "10.0.0.0/16"
+  podCidr: "10.244.0.0/16"
+  serviceCidr: "10.96.0.0/12"
+  controlPlaneCidr: "10.0.0.5/32"
+  allowInternetHttps: false
+  proxyNamespace: proxy
+  proxyPort: 8080
+  # proxyPodLabels optional — narrows the proxy namespace peer to specific pods
+  # proxyEgressCidrs only for external/node-level proxies — not Service ClusterIP (use proxyNamespace above)
+```
+
+### Example values (SaaS with explicit gateway CIDRs)
+
+Use when `allowInternetHttps=false` for least-privilege egress instead of the default `0.0.0.0/0:443` rule. Set `global.gateway.address` to the hostname from your onboarding email and `global.gateway.port: 443`. Resolve the hostname with your own DNS lookup and add the returned addresses to `gatewayEgressCidrs` — the placeholder below is private RFC1918 only; substitute your gateway's actual endpoint CIDRs.
+
+```yaml
+global:
+  gateway:
+    address: <gateway_url>
+    port: 443
+
+networkPolicy:
+  enabled: true
+  nodeCidr: "10.0.0.0/16"
+  podCidr: "10.244.0.0/16"
+  serviceCidr: "10.96.0.0/12"
+  controlPlaneCidr: "10.0.0.5/32"
+  allowInternetHttps: false
+  gatewayEgressCidrs:
+    - "10.200.0.10/32"    # placeholder — replace with your gateway endpoint CIDR(s)
+```
+
+### Validating NetworkPolicy and webhook reachability
+
+Pod `Ready`, gateway registration logs, and a successful test workload do **not** prove the apiserver can reach the KE admission webhook on port 8443 through the NetworkPolicy. With `webhooks.failurePolicy: Ignore` (the default), webhook failures are silent — workloads are admitted without enforcement.
+
+**Recommended rollout validation**
+
+1. **Temporarily set `webhooks.failurePolicy: Fail`** during NetworkPolicy rollout. A misconfigured ingress rule should cause admission failures on test workloads, making connectivity problems visible immediately.
+
+   ⚠️ **Before doing this**, note that `webhooks.validatingWebhook.namespaceSelector` is empty (`{}`) by default, i.e. cluster-wide, including `kube-system`. If the NetworkPolicy ingress rule is even slightly wrong while `failurePolicy: Fail` is active, the webhook becomes unreachable and **every** resource create/update cluster-wide is rejected — including the changes needed to fix the NetworkPolicy itself. Validate on a non-production cluster first, or scope `webhooks.validatingWebhook.namespaceSelector` to exclude `kube-system` and `kube-node-lease` (see the commented example in `values.yaml`) before switching to `Fail`.
+2. **Watch apiserver webhook metrics and events** during rollout:
+   - With `webhooks.failurePolicy: Fail` — `apiserver_admission_webhook_rejection_count` (metric name may vary by Kubernetes version; verify on your apiserver `/metrics`) spikes when admission calls are rejected
+   - With `webhooks.failurePolicy: Ignore` (default) — blocked webhooks time out and fail open; watch `apiserver_admission_webhook_fail_open_count` instead of the rejection counter
+   - Kubernetes events mentioning webhook timeouts or connection failures
+3. **Confirm apiserver → KE connectivity on 8443** — not only pod `Ready`:
+   - From a node or debug pod with network paths similar to the apiserver, test TCP connectivity to the KE Service ClusterIP or pod IP on port 8443
+   - With `failurePolicy: Fail`, create a test workload; admission errors in `kubectl` output confirm webhook reachability (or expose a blocked path)
+4. After validation succeeds, revert `webhooks.failurePolicy` to `Ignore` if you prefer availability over fail-closed admission (see tradeoff below).
+
+**`failurePolicy` tradeoff (especially with NetworkPolicy enabled)**
+
+| Policy | On webhook failure | Typical use |
+|--------|-------------------|-------------|
+| `Ignore` | Workload admitted; enforcement skipped (silent security regression) | Production availability; default in this chart |
+| `Fail` | Workload creation/update rejected | Rollout validation; strict enforcement |
+
+When `networkPolicy.enabled=true`, a too-restrictive ingress rule blocks apiserver → KE webhook traffic. With `Ignore`, the deployment can look healthy (pod Ready, gateway registered) while new workloads bypass KubeEnforcer. Use `Fail` temporarily to validate policy rules, then switch back if desired.
+
 ## Configuration for KubeEnforcer with cert-manager
 
    1. Create self-signed `ClusterIssuer` and `Certificate` needed by Aqua:
@@ -338,7 +585,8 @@ To perform kube-bench scans in the cluster, the KubeEnforcer needs:
 
 ## Integrate Kube-Enforcer with Hashicorp Vault to Load Token
 * Hashicorp Vault is a secrets management tools.
-* Kube-enforcer charts supports to load token values from vault by vault-agent using annotations. To enable the Vault integration enable `vaultSecret.enable=true`, add vault secret filepath `vaultSecret.vaultFilepath= ""` and uncomment the `vaultAnnotations`.
+* Kube-enforcer charts supports to load token values from vault by vault-agent using annotations. To enable the Vault integration enable `vaultSecret.enabled=true`, add vault secret filepath `vaultSecret.vaultFilepath= ""` and uncomment the `vaultAnnotations`.
+* When `networkPolicy.enabled=true`, configure Vault egress: `networkPolicy.vaultNamespace` for in-cluster Vault (port 8200, `vaultExternal=false`), or `networkPolicy.vaultExternal=true` with `vaultEgressCidrs` / `allowInternetHttps=true` for HCP/SaaS Vault on 443.
 * `vaultAnnotations` - Change the vault annotations according as per your vault setup, Annotations support both self-hosted and SaaS Vault setups.
 
 ## Configurable Variables
@@ -365,6 +613,34 @@ To perform kube-bench scans in the cluster, the KubeEnforcer needs:
 | `image.tag`                                                  | Kube-enforcer image tag to use.                                                                                                                                                                                                                      | `2022.4`                                 | `Yes`                                                                                            |
 | `image.pullPolicy`                                           | The kubernetes image pull policy.                                                                                                                                                                                                                    | `Always`                                 | `Yes`                                                                                            |
 | `hostNetwork`                                                | Set pod hostNetwork                                                                                                                                                                                                                                  | `false`                                  | `NO`                                                                                             |
+| `networkPolicy.enabled`                                      | Enable optional NetworkPolicy for kube-enforcer                                                                                                                                                                                                      | `false`                                  | `No`                                                                                             |
+| `networkPolicy.nodeCidr`                                     | Worker node CIDR (IPv4)                                                                                                                                                                                                                              | `""`                                     | `Yes` </br> `if networkPolicy.enabled`                                                           |
+| `networkPolicy.nodeCidrV6`                                   | Optional IPv6 worker node CIDR for dual-stack clusters                                                                                                                                                                                               | `""`                                     | `No`                                                                                             |
+| `networkPolicy.podCidr`                                      | Pod CIDR (IPv4)                                                                                                                                                                                                                                      | `""`                                     | `Yes` </br> `if networkPolicy.enabled`                                                           |
+| `networkPolicy.podCidrV6`                                    | Optional IPv6 pod CIDR for dual-stack clusters                                                                                                                                                                                                       | `""`                                     | `No`                                                                                             |
+| `networkPolicy.serviceCidr`                                  | Service CIDR (egress to in-cluster `kubernetes` Service on port 443; kubeadm/kube-proxy path). Omit on managed clouds — use `additionalEgressCidrs` instead                                                                                        | `""`                                     | `No`                                                                                             |
+| `networkPolicy.serviceCidrV6`                                | Optional IPv6 service CIDR for dual-stack clusters                                                                                                                                                                                                   | `""`                                     | `No`                                                                                             |
+| `networkPolicy.controlPlaneCidr`                             | Control-plane node IP or CIDR (apiserver webhook ingress on 8443; in-cluster API egress on port 6443). Omit on managed clouds when using `additional*Cidrs`                                                                                          | `""`                                     | `No`                                                                                             |
+| `networkPolicy.controlPlaneCidrV6`                           | Optional IPv6 control-plane CIDR for dual-stack clusters                                                                                                                                                                                             | `""`                                     | `No`                                                                                             |
+| `networkPolicy.additionalIngressCidrs`                       | Extra ingress CIDRs for apiserver → KE webhook (8443) and kubelet probes (readinessProbe/livenessProbe port, default 8080); managed-cloud sources not covered by node/pod/control-plane CIDRs                                                       | `[]`                                     | `No`                                                                                             |
+| `networkPolicy.additionalEgressCidrs`                        | Extra egress CIDRs for KE → apiserver (managed-cloud endpoint IPs after DNAT). Flat CIDR strings use ports 443 and 6443; objects support `{cidr, ports}` (ports default to 443 and 6443 when omitted) | `[]`                                     | `No`                                                                                             |
+| `networkPolicy.allowInternetHttps`                           | Add `0.0.0.0/0:443` and `::/0:443` egress (default SaaS catch-all). Set `false` for least-privilege egress; use `gatewayEgressCidrs` / `gatewayNamespace` for gateway traffic                                                                        | `true`                                   | `No`                                                                                             |
+| `networkPolicy.gatewayEgressCidrs`                           | External gateway, node, or LB CIDRs (not in-cluster Service ClusterIP); uses `global.gateway.port`                                                                                                                                                   | `[]`                                     | `Yes` </br> `if networkPolicy.enabled` and `global.gateway.port` ≠ 443 and neither `gatewayNamespace` nor `allowInternetHttps` covers gateway |
+| `networkPolicy.gatewayNamespace`                             | In-cluster gateway namespace (preferred over Service ClusterIP on Calico-style CNIs)                                                                                                                                                                 | `""`                                     | `Yes` </br> `if networkPolicy.enabled` and `global.gateway.port` ≠ 443 and `gatewayEgressCidrs` empty and `allowInternetHttps` does not cover gateway |
+| `networkPolicy.gatewayPodLabels`                             | Pod labels matched with `gatewayNamespace` (required when `gatewayNamespace` is set)                                                                                                                                                                 | `aqua.component: gateway`                | `Yes` </br> `if gatewayNamespace` is set                                                         |
+| `networkPolicy.proxyNamespace`                               | In-cluster HTTP proxy namespace (see `extraEnvironmentVars.http_proxy`/`https_proxy`); requires `proxyPort`                                                                                                                                          | `""`                                     | `Yes` </br> `if extraEnvironmentVars` sets `http_proxy`/`https_proxy` and `proxyEgressCidrs` empty |
+| `networkPolicy.proxyPodLabels`                                | Optional pod labels matched with `proxyNamespace`                                                                                                                                                                                                    | `{}`                                     | `No`                                                                                             |
+| `networkPolicy.proxyEgressCidrs`                              | External/node-level HTTP proxy CIDRs; requires `proxyPort`                                                                                                                                                                                           | `[]`                                     | `Yes` </br> `if extraEnvironmentVars` sets `http_proxy`/`https_proxy` and `proxyNamespace` empty |
+| `networkPolicy.proxyPort`                                     | HTTP proxy listening port                                                                                                                                                                                                                             | `""`                                     | `Yes` </br> `if proxyNamespace` or `proxyEgressCidrs` is set                                      |
+| `networkPolicy.vaultNamespace`                               | In-cluster Vault namespace for vault-agent egress on `vaultPort` (8200)                                                                                                                                                                              | `""`                                     | `Yes` </br> `if vaultSecret.enabled`, `networkPolicy.enabled`, and `vaultExternal=false` (default) |
+| `networkPolicy.vaultExternal`                                | `true`: external/HCP Vault on 443 — use `allowInternetHttps` or `vaultEgressCidrs`. `false`: in-cluster Vault — requires `vaultNamespace`                                                                                                            | `false`                                  | `No`                                                                                             |
+| `networkPolicy.vaultPodLabels`                             | Optional pod labels matched with `vaultNamespace`                                                                                                                                                                                                    | `{}`                                     | `No`                                                                                             |
+| `networkPolicy.vaultPort`                                    | In-cluster Vault API port                                                                                                                                                                                                                            | `8200`                                   | `No`                                                                                             |
+| `networkPolicy.vaultEgressCidrs`                             | External/HCP Vault endpoint CIDRs; uses `vaultEgressPort`                                                                                                                                                                                            | `[]`                                     | `Yes` </br> `if vaultSecret.enabled`, `networkPolicy.enabled`, `vaultExternal=true`, and `allowInternetHttps=false` |
+| `networkPolicy.vaultEgressPort`                              | External/HCP Vault API port                                                                                                                                                                                                                          | `443`                                    | `No`                                                                                             |
+| `networkPolicy.dnsNamespace`                                 | Namespace for DNS egress (UDP/TCP 53). Default `kube-system`; auto `openshift-dns` when `global.platform=openshift`                                                                                                                                  | `kube-system`                            | `No`                                                                                             |
+| `networkPolicy.dnsPodLabels`                                 | Optional pod labels to narrow DNS egress within `dnsNamespace` (e.g. `k8s-app: kube-dns`); unset allows the whole namespace on port 53                                                                                                              | `{}`                                     | `No`                                                                                             |
+| `networkPolicy.ingressSystemNamespace`                       | Namespace for ingress from apiserver proxy pods (e.g. GKE konnectivity). Default `kube-system`; independent of `dnsNamespace`                                                                                                                        | `kube-system`                            | `No`                                                                                             |
 | `microEnforcerImage.repository`                              | MicroEnforcer docker image name                                                                                                                                                                                                                      | `microenforcer`                          | `YES`                                                                                            |
 | `microEnforcerImage.tag`                                     | MicroEnforcer docker image tag                                                                                                                                                                                                                       | `2022.4`                                 | `YES`                                                                                            |
 | `kubebenchImage.repository`                                  | KubeBench docker image name                                                                                                                                                                                                                          | `aquasec/kube-bench`                     | `YES`                                                                                            |
@@ -380,7 +656,7 @@ To perform kube-bench scans in the cluster, the KubeEnforcer needs:
 | `certsSecret.serverCertificate`                              | Public certificate for TLS authentication with the Kubernetes api-server, If certsSecret.create is enable to true, Add base64 value of the Public Certificate(server certificate) or add filename of certificate if it is loading from custom secret | `N/A`                                    | `Yes`                                                                                            |
 | `certsSecret.serverKey`                                      | Certificate key for TLS authentication with the Kubernetes api-server, If certsSecret.create is enable to true, Add base64 value of the Private Key(server key) or add filename of key if it is loading from custom secret                           | `N/A`                                    | `Yes`                                                                                            |
 | `dnsNdots`                                                   | Modifies ndots DNS configuration for the deployment                                                                                                                                                                                                  | `unset`                                  | `NO`                                                                                             |
-| `vaultSecret.enable`                                         | Enable to true once you have secrets in vault and annotations are enabled to load enforcer token from hashicorp vault                                                                                                                                | `false`                                  | `No`                                                                                             |
+| `vaultSecret.enabled`                                         | Enable to true once you have secrets in vault and annotations are enabled to load enforcer token from hashicorp vault                                                                                                                                | `false`                                  | `No`                                                                                             |
 | `vaultSecret.vaultFilepath`                                  | Change the path to "/vault/secrets/<filename>" as per the setup                                                                                                                                                                                      | `""`                                     | `No`                                                                                             |
 | `aquaSecret.create`                                          | Aqua KubeEnforcer (KE) token secret creation                                                                                                                                                                                                         | `true`                                   | `Yes`                                                                                            |
 | `aquaSecret.name`                                            | Aqua KubeEnforcer (KE) token secret name                                                                                                                                                                                                             | `aqua-kube-enforcer-token`               | `Yes`                                                                                            |
@@ -392,7 +668,7 @@ To perform kube-bench scans in the cluster, the KubeEnforcer needs:
 | `roleBinding.name`                                           | KE roleBinding name                                                                                                                                                                                                                                  | `aqua-kube-enforcer`                     | `Yes`                                                                                            |
 | `webhooks.certManager`                                       | Enable to true if using KE webhook certificates generated from kubernetes cert-manager                                                                                                                                                               | `false`                                  | `No`                                                                                             |
 | `webhooks.caBundle`                                          | Root certificate for TLS authentication with the Kubernetes api-server, Add base64 value of the CA cert/Ca Bundle/RootCA Cert if certificates are not generated from cert-manager to webhooks.caBundle                                               | `N/A`                                    | `Yes` </br> `if webhooks.certManager is false`                                                   |
-| `webhooks.failurePolicy`                                     | Webhook failure policy                                                                                                                                                                                                                               | `false`                                  | `Yes`                                                                                            |
+| `webhooks.failurePolicy`                                     | Webhook failure policy (`Ignore` or `Fail`). Default `Ignore` admits workloads when the webhook is unreachable — see [Validating NetworkPolicy and webhook reachability](#validating-networkpolicy-and-webhook-reachability) for rollout validation with `Fail` | `Ignore`                                 | `Yes`                                                                                            |
 | `webhooks.validatingWebhook.name`                            | KE validating webhook name                                                                                                                                                                                                                           | `kube-enforcer-admission-hook-config`    | `Yes`                                                                                            |
 | `webhooks.validatingWebhook.timeout`                         | KE validating webhook timeout                                                                                                                                                                                                                        | `2`                                      | `Yes`                                                                                            |
 | `webhooks.validatingWebhook.annotations`                     | KE validating webhook annotations                                                                                                                                                                                                                    | `{}`                                     | `No`                                                                                             |
