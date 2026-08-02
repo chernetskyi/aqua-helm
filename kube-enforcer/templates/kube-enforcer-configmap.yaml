@@ -60,4 +60,8 @@ data:
   AQUA_TLS_PORT: "8443"
 {{- end }}
   AQUA_KB_SCAN_TAINTED_NODES: "{{ .Values.kubeBench.scanTainted }}"
+  {{- if .Values.featureFlagOverrides }}
+  # Feature flags pinned locally; the console/Gateway cannot change these. Restart required to apply.
+  AQUA_FEATURE_FLAG_OVERRIDES: {{ .Values.featureFlagOverrides | quote }}
+  {{- end }}
 

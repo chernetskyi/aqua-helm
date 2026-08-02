@@ -108,6 +108,21 @@ logLevel: ""
 # Comma-separated node-labels for nodes on which Kube-Bench is to be skipped. key1=val1,key2=val2,...
 skipNodes: ""
 
+# Pin Kube-Enforcer feature flags to a fixed value, overriding whatever the Aqua console/Gateway
+# sends. Comma-separated <flag>=<true|false> pairs. Leave blank to let the console control every
+# flag (the default).
+#
+# Set this in a values file. Helm's --set reads an unescaped comma as a value separator, so it keeps
+# only the first pin and silently discards the rest - and --set-string behaves the same way:
+#   featureFlagOverrides: "SLK-93383=false,KubeBench with KE=true"
+# If you must use --set, escape every comma:
+#   --set 'featureFlagOverrides=SLK-93383=false\,KubeBench with KE=true'
+#
+# A pinned flag cannot be changed from the console or by 'kubenf featureflags update', and shows up
+# as "pinned locally" in the Kube-Enforcer health output. Read at startup only, so changing this
+# requires a Kube-Enforcer restart.
+featureFlagOverrides: ""
+
 # Set create to false if you want to use an existing secret for the kube-enforcer certs
 # If certsSecret.create and certsSecret.name defined then need provide certsSecret.serverCertificate and
 # certsSecret.serverKey and webhooks.caBundle encrypted with base64 and secret for TLS connectivity with kube-api will be created
