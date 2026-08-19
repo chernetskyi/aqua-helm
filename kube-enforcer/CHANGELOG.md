@@ -1,6 +1,9 @@
 # Changelog
 All notable changes to this project will be documented in this file.
 
+## 2022.4.83 ( August 18th, 2026 )
+* Add optional NetworkPolicy support for kube-enforcer
+
 ## 2022.4.82 ( August 17th, 2026 )
 * updated kube-bench version to 0.16.0.
 

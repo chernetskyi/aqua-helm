@@ -183,11 +183,46 @@ roleBinding:
   name: "aqua-kube-enforcer"
 
 hostNetwork: false
+
+# Optional NetworkPolicy for kube-enforcer. Requires a CNI with NetworkPolicy support (e.g. Calico).
+# Replace placeholder CIDRs before enabling. See README for discovery commands and warnings.
+networkPolicy:
+  enabled: false
+  nodeCidr: ""                     # worker node CIDR; required when enabled; see README example values
+  nodeCidrV6: ""                   # optional IPv6 worker node CIDR for dual-stack clusters
+  podCidr: ""                      # required when enabled; see README example values
+  podCidrV6: ""                    # optional IPv6 pod CIDR for dual-stack clusters
+  serviceCidr: ""                  # kubernetes Service CIDR; egress to in-cluster API on 443; omit on managed clouds (use additionalEgressCidrs)
+  serviceCidrV6: ""                # optional IPv6 service CIDR for dual-stack clusters
+  controlPlaneCidr: ""             # control-plane IP/CIDR (webhook ingress + API egress); omit on managed clouds when using additional*Cidrs
+  controlPlaneCidrV6: ""           # optional IPv6 control-plane CIDR for dual-stack clusters
+  additionalIngressCidrs: []       # apiserver → KE webhook (8443) and kubelet probes (readinessProbe/livenessProbe port, default 8080); managed-cloud sources not covered above
+  additionalEgressCidrs: []        # KE → apiserver (443/6443); private CIDR or your endpoint output for public APIs
+  allowInternetHttps: true         # false: omit 0.0.0.0/0 and ::/0:443; use gatewayEgressCidrs for on-prem or SaaS
+  gatewayEgressCidrs: []           # external gateway / node / LB CIDRs (not Service ClusterIP — use gatewayNamespace); uses global.gateway.port
+  gatewayNamespace: ""             # in-cluster gateway namespace; requires gatewayPodLabels when set
+  gatewayPodLabels:                # required with gatewayNamespace
+    aqua.component: gateway
+  proxyNamespace: ""               # in-cluster HTTP proxy namespace (see extraEnvironmentVars.http_proxy/https_proxy); optional proxyPodLabels; requires proxyPort
+  proxyPodLabels: {}               # optional pod labels matched with proxyNamespace
+  proxyEgressCidrs: []             # external/node-level HTTP proxy CIDRs; requires proxyPort
+  proxyPort: ""                    # HTTP proxy port; required when proxyNamespace or proxyEgressCidrs is set
+  vaultNamespace: ""               # in-cluster Vault namespace (port 8200); required with vaultSecret.enabled when vaultExternal=false
+  vaultPodLabels: {}               # optional pod labels matched with vaultNamespace
+  vaultPort: 8200                  # in-cluster Vault API port
+  vaultExternal: false             # true: external/HCP Vault on 443 — use allowInternetHttps or vaultEgressCidrs; false: in-cluster Vault — requires vaultNamespace
+  vaultEgressCidrs: []             # external/HCP Vault endpoint CIDRs; uses vaultEgressPort
+  vaultEgressPort: 443             # external/HCP Vault API port
+  dnsNamespace: ""                 # DNS egress namespace; default kube-system (openshift-dns when global.platform=openshift)
+  dnsPodLabels: {}                 # optional pod labels to narrow DNS egress within dnsNamespace (e.g. k8s-app: kube-dns); default allows the whole namespace on port 53
+  ingressSystemNamespace: ""       # ingress from kube-system pods (konnectivity/apiserver proxy); default kube-system — independent of dnsNamespace
+
 webhooks:
   # set this field true if you're using cert-manager and don't need to pass a caBundle
   certManager: false
   # Add base64 value of the CA cert/Ca Bundle/RootCA Cert if certificates are not generated from cert-manager to webhooks.caBundle
   caBundle: ""
+  # Ignore: admit workloads if webhook unreachable (availability). Use Fail during NetworkPolicy rollout to surface blocked apiserver→KE ingress on 8443; see README.
   failurePolicy: Ignore
   validatingWebhook:
     enabled: true

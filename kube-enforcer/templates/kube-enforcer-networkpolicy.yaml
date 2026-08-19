@@ -1,0 +1,163 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $errors := list }}
+{{- if .Values.hostNetwork }}
+{{- $errors = append $errors "networkPolicy.enabled has no effect when hostNetwork is true; set hostNetwork=false or disable networkPolicy" }}
+{{- end }}
+{{- if not (or .Values.networkPolicy.nodeCidr .Values.networkPolicy.nodeCidrV6) }}
+{{- $errors = append $errors "networkPolicy.nodeCidr or networkPolicy.nodeCidrV6 is required when networkPolicy.enabled is true" }}
+{{- end }}
+{{- if not (or .Values.networkPolicy.podCidr .Values.networkPolicy.podCidrV6) }}
+{{- $errors = append $errors "networkPolicy.podCidr or networkPolicy.podCidrV6 is required when networkPolicy.enabled is true" }}
+{{- end }}
+{{- $gateway := .Values.global.gateway | default (dict) }}
+{{- $gatewayPort := include "networkPolicy.validatedPort" (dict "label" "global.gateway.port" "value" ($gateway.port | default "8443")) | int }}
+{{- $proxyPort := "" }}
+{{- if .Values.networkPolicy.proxyPort }}
+{{- $proxyPort = include "networkPolicy.validatedPort" (dict "label" "networkPolicy.proxyPort" "value" .Values.networkPolicy.proxyPort) | int }}
+{{- end }}
+{{- $vaultPort := include "networkPolicy.validatedPort" (dict "label" "networkPolicy.vaultPort" "value" (.Values.networkPolicy.vaultPort | default 8200)) | int }}
+{{- $vaultEgressPort := include "networkPolicy.validatedPort" (dict "label" "networkPolicy.vaultEgressPort" "value" (.Values.networkPolicy.vaultEgressPort | default 443)) | int }}
+{{- $controlPlaneIpBlock := "" }}
+{{- if or .Values.networkPolicy.controlPlaneCidr .Values.networkPolicy.controlPlaneCidrV6 }}
+{{- $controlPlaneIpBlock = include "networkPolicy.ipBlock" (dict "cidr" .Values.networkPolicy.controlPlaneCidr "cidrV6" .Values.networkPolicy.controlPlaneCidrV6) | trim }}
+{{- end }}
+{{- $hasGatewayEgress := or .Values.networkPolicy.gatewayEgressCidrs .Values.networkPolicy.gatewayNamespace }}
+{{- $internetCoversGateway := and .Values.networkPolicy.allowInternetHttps (eq $gatewayPort 443) }}
+{{- if not (or $hasGatewayEgress $internetCoversGateway) }}
+{{- $errors = append $errors (printf "networkPolicy.gatewayEgressCidrs or networkPolicy.gatewayNamespace is required when networkPolicy.enabled is true and global.gateway.port is %v (allowInternetHttps only covers port 443)" $gatewayPort) }}
+{{- end }}
+{{- if and .Values.networkPolicy.gatewayNamespace (or (not .Values.networkPolicy.gatewayPodLabels) (empty .Values.networkPolicy.gatewayPodLabels)) }}
+{{- $errors = append $errors "networkPolicy.gatewayPodLabels is required when networkPolicy.gatewayNamespace is set (non-empty label map; use chart defaults or set explicit labels)" }}
+{{- end }}
+{{- if and (or .Values.networkPolicy.proxyNamespace .Values.networkPolicy.proxyEgressCidrs) (not .Values.networkPolicy.proxyPort) }}
+{{- $errors = append $errors "networkPolicy.proxyPort is required when networkPolicy.proxyNamespace or networkPolicy.proxyEgressCidrs is set" }}
+{{- end }}
+{{- $hasProxyEnv := false }}
+{{- range $key, $_ := .Values.extraEnvironmentVars }}
+{{- if or (eq ($key | lower) "http_proxy") (eq ($key | lower) "https_proxy") }}
+{{- $hasProxyEnv = true }}
+{{- end }}
+{{- end }}
+{{- if and $hasProxyEnv (not (or .Values.networkPolicy.proxyNamespace .Values.networkPolicy.proxyEgressCidrs)) }}
+{{- $errors = append $errors "networkPolicy.proxyNamespace or networkPolicy.proxyEgressCidrs is required when extraEnvironmentVars sets http_proxy/https_proxy and networkPolicy.enabled is true" }}
+{{- end }}
+{{- if and .Values.vaultSecret.enabled (not .Values.networkPolicy.vaultNamespace) }}
+{{- if not (or .Values.networkPolicy.vaultEgressCidrs (and .Values.networkPolicy.allowInternetHttps .Values.networkPolicy.vaultExternal)) }}
+{{- $errors = append $errors "networkPolicy.vaultNamespace is required for in-cluster Vault (port 8200); for external/HCP Vault set vaultExternal=true and allowInternetHttps=true or vaultEgressCidrs" }}
+{{- end }}
+{{- end }}
+{{- if $errors }}
+{{- fail (printf "networkPolicy configuration errors:\n- %s" (join "\n- " $errors)) }}
+{{- end }}
+# Optional NetworkPolicy for kube-enforcer; see README for scope, CIDR requirements, and warnings.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "kube-enforcer.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    role: {{ .Release.Name }}
+    app: {{ include "kube-enforcer.fullname" . }}
+    aqua.component: kubeenforcer
+{{ include "aqua.labels" . | indent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app: {{ include "kube-enforcer.fullname" . }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        {{- include "networkPolicy.ipBlock" (dict "cidr" .Values.networkPolicy.nodeCidr "cidrV6" .Values.networkPolicy.nodeCidrV6) | trim | nindent 8 }}
+        {{- include "networkPolicy.ipBlock" (dict "cidr" .Values.networkPolicy.podCidr "cidrV6" .Values.networkPolicy.podCidrV6) | trim | nindent 8 }}
+        {{- if $controlPlaneIpBlock }}
+        {{- $controlPlaneIpBlock | nindent 8 }}
+        {{- end }}
+        {{- range .Values.networkPolicy.additionalIngressCidrs }}
+        {{- if not (kindIs "string" .) }}
+        {{- fail "networkPolicy.additionalIngressCidrs entries must be plain CIDR strings; unlike additionalEgressCidrs, this field does not support {cidr, ports} objects" }}
+        {{- end }}
+        - ipBlock:
+            cidr: {{ . | quote }}
+        {{- end }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "networkPolicy.ingressSystemNamespace" . | quote }}
+      ports:
+        - protocol: TCP
+          port: 8443
+        {{- $probePorts := include "networkPolicy.probePorts" . | trim }}
+        {{- if $probePorts }}
+        {{- $probePorts | nindent 8 }}
+        {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ include "networkPolicy.dnsNamespace" . | quote }}
+          {{- with .Values.networkPolicy.dnsPodLabels }}
+          {{- if not (kindIs "map" .) }}
+          {{- fail "networkPolicy.dnsPodLabels must be a map of pod labels" }}
+          {{- end }}
+          podSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+          {{- end }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- if or .Values.networkPolicy.serviceCidr .Values.networkPolicy.serviceCidrV6 }}
+    # kubeadm/kube-proxy: KE → kubernetes Service ClusterIP before apiserver DNAT
+    - to:
+        {{- include "networkPolicy.ipBlock" (dict "cidr" .Values.networkPolicy.serviceCidr "cidrV6" .Values.networkPolicy.serviceCidrV6) | trim | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+    {{- if $controlPlaneIpBlock }}
+    - to:
+        {{- $controlPlaneIpBlock | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 6443
+    {{- end }}
+    {{- range .Values.networkPolicy.additionalEgressCidrs }}
+    {{- if and (not (kindIs "string" .)) (not (kindIs "map" .)) }}
+    {{- fail "networkPolicy.additionalEgressCidrs entries must be either a plain CIDR string or a {cidr, ports} object" }}
+    {{- end }}
+    - to:
+        - ipBlock:
+            cidr: {{ if kindIs "string" . }}{{ . | quote }}{{ else }}{{ required "networkPolicy.additionalEgressCidrs entry requires cidr" .cidr | quote }}{{ end }}
+      ports:
+        {{- /* An empty/absent .ports falls back to the default ports rather than rendering
+        a bare "ports:" — Kubernetes treats an empty ports list the same as omitting it
+        entirely (allow all ports), which is broader than a plain-CIDR entry gets. */ -}}
+        {{- if and (kindIs "map" .) .ports }}
+        {{- range .ports }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+        {{- else }}
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+        {{- end }}
+    {{- end }}
+    {{- include "networkPolicy.cidrListEgress" (dict "cidrs" .Values.networkPolicy.gatewayEgressCidrs "port" $gatewayPort) }}
+    {{- include "networkPolicy.namespaceEgress" (dict "namespace" .Values.networkPolicy.gatewayNamespace "podLabels" .Values.networkPolicy.gatewayPodLabels "podLabelsField" "networkPolicy.gatewayPodLabels" "port" $gatewayPort) }}
+    {{- include "networkPolicy.cidrListEgress" (dict "cidrs" .Values.networkPolicy.proxyEgressCidrs "port" $proxyPort) }}
+    {{- include "networkPolicy.namespaceEgress" (dict "namespace" .Values.networkPolicy.proxyNamespace "podLabels" .Values.networkPolicy.proxyPodLabels "podLabelsField" "networkPolicy.proxyPodLabels" "port" $proxyPort) }}
+    {{- include "networkPolicy.namespaceEgress" (dict "namespace" .Values.networkPolicy.vaultNamespace "podLabels" .Values.networkPolicy.vaultPodLabels "podLabelsField" "networkPolicy.vaultPodLabels" "port" $vaultPort) }}
+    {{- include "networkPolicy.cidrListEgress" (dict "cidrs" .Values.networkPolicy.vaultEgressCidrs "port" $vaultEgressPort) }}
+    {{- if .Values.networkPolicy.allowInternetHttps }}
+    - to:
+        {{- include "networkPolicy.ipBlock" (dict "cidr" "0.0.0.0/0" "cidrV6" "::/0") | trim | nindent 8 }}
+      ports:
+        - protocol: TCP
+          port: 443
+    {{- end }}
+{{- end }}
